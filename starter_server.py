@@ -3,10 +3,10 @@ import os
 import json
 import logging
 import re
-from typing import List, Dict, Optional,TypedDict
+from typing import List, Dict, Optional, TypedDict
 from firecrawl import FirecrawlApp
 from urllib.parse import urlparse
-from datetime import datetime,timedelta
+from datetime import datetime, timedelta
 from mcp.server.fastmcp import FastMCP
 
 from dotenv import load_dotenv
@@ -38,7 +38,7 @@ class MetadataEntry(TypedDict):
     scrape_time: str
     scraped_at: str
     content_files: Dict[str, str]
-    content:Dict[str, str]
+    content: Dict[str, str]
     formats: List[str]
     title: str
     description: str
@@ -48,27 +48,29 @@ class MetadataEntry(TypedDict):
 def create_empty_metadata_entry(name: str, url: str) -> MetadataEntry:
     """
     Create an empty MetadataEntry with minimal required fields.
-    
+
     Args:
         name: The provider/website name
         url: The website URL
-        
+
     Returns:
         A MetadataEntry with empty/default values for content fields
     """
-    return MetadataEntry(
-        name=name,
-        url=url,
-        domain=urlparse(url).netloc,
-        scrape_time=datetime.now().isoformat(),
-        scraped_at=datetime.now().isoformat(),
-        content_files={},
-        content={},
-        formats=[],
-        title="",
-        description="",
-        success=False
-    )
+    entry: MetadataEntry = {
+        "name": name,
+        "url": url,
+        "domain": urlparse(url).netloc,
+        "scrape_time": datetime.now().isoformat(),
+        "scraped_at": datetime.now().isoformat(),
+        "formats": [],
+        "title": "",
+        "description": "",
+        "content_files": {},
+        "content": {},
+        "success": False
+    }
+    return entry
+
 # ===========================================================================
 #                            Metadata
 # ===========================================================================
@@ -78,7 +80,7 @@ def metadata_save(path: str, metadata: Dict):
     metadata_file = os.path.join(path, "scraped_metadata.json")
     logger.info(f"Saving metadata to file: {metadata_file}")
     try:
-        with open(metadata_file, "w",encoding="utf-8") as file:
+        with open(metadata_file, "w", encoding="utf-8") as file:
             json.dump(metadata, file, indent=2)
     except IOError as e:
         logger.error(f"IO error saving metadata to {metadata_file}: {e}")
@@ -96,7 +98,7 @@ def metadata_load(path: str) -> Dict:
 
     logger.info(f"Loading metadata from file: {metadata_file}")
     try:
-        with open(metadata_file, "r",encoding="utf-8") as file:
+        with open(metadata_file, "r", encoding="utf-8") as file:
             return json.load(file)
     except FileNotFoundError:
         logger.warning(f"Metadata file not found: {metadata_file}")
@@ -120,7 +122,7 @@ def metadata_load(path: str) -> Dict:
 def save_scrape_result(path: str, content):
     logger.info(f"Saving scrape result to file: {path}")
     try:
-        with open(path, "w",encoding="utf-8") as file:
+        with open(path, "w", encoding="utf-8") as file:
             file.write(content)
     except IOError as e:
         logger.error(f"IO error saving scrape result to {path}: {e}")
@@ -133,7 +135,7 @@ def save_scrape_result(path: str, content):
 def load_scrape_result(path: str):
     logger.info(f"Loading scrape result from file: {path}")
     try:
-        with open(path, "r",encoding="utf-8") as file:
+        with open(path, "r", encoding="utf-8") as file:
             return file.read()
     except FileNotFoundError:
         logger.error(f"Scrape result file not found: {path}")
@@ -147,16 +149,16 @@ def load_scrape_result(path: str):
         raise
 
 
-def should_skip_scrape(name: str,metadata: Dict[str, MetadataEntry]) -> bool:
+def should_skip_scrape(name: str, metadata: Dict[str, MetadataEntry]) -> bool:
     """Check if a provider was successfully scraped within the last 3 hours."""
-    
+
     if name not in metadata:
         return False
-    
+
     try:
-        entry: MetadataEntry  = metadata[name]
-        scrape_time:datetime = datetime.fromisoformat(entry['scrape_time'])
-        cutoff_time:datetime = datetime.now() - timedelta(hours=3)
+        entry: MetadataEntry = metadata[name]
+        scrape_time: datetime = datetime.fromisoformat(entry['scrape_time'])
+        cutoff_time: datetime = datetime.now() - timedelta(hours=3)
         return scrape_time > cutoff_time
     except (ValueError, KeyError):
         return False
@@ -165,10 +167,10 @@ def should_skip_scrape(name: str,metadata: Dict[str, MetadataEntry]) -> bool:
 def normalize_filename(name: str) -> str:
     """
     Normalize a name to create a safe filename.
-    
+
     Args:
         name: The provider/website name
-        
+
     Returns:
         A normalized filename-safe string
     """
@@ -194,33 +196,34 @@ def scrape_websites(
 ) -> List[str]:
     """
     Scrape multiple websites using Firecrawl and store their content.
-    
+
     Args:
         websites: Dictionary of provider_name -> URL mappings
         formats: List of formats to scrape ['markdown', 'html'] (default: both)
         api_key: Firecrawl API key (if None, expects environment variable)
-        
+
     Returns:
         List of provider names for successfully scraped websites
     """
-    
+
     if api_key is None:
         api_key = os.getenv('FIRECRAWL_API_KEY')
         if not api_key:
-            raise ValueError("API key must be provided or set as FIRECRAWL_API_KEY environment variable")
-    
+            raise ValueError(
+                "API key must be provided or set as FIRECRAWL_API_KEY environment variable")
+
     app = FirecrawlApp(api_key=api_key)
-    
+
     path = os.path.join(SCRAPE_DIR)
     os.makedirs(path, exist_ok=True)
-    
-    metadata:Dict[str, MetadataEntry] = metadata_load(path)
+
+    metadata: Dict[str, MetadataEntry] = metadata_load(path)
 
     successful_scrapes = []
     for name, url in websites.items():
 
         # Skip successful entries less than 3 hours old
-        if should_skip_scrape(name,metadata):
+        if should_skip_scrape(name, metadata):
             logger.info(f"Skipping {name}: recently scraped successfully")
             successful_scrapes.append(name)
             continue
@@ -231,9 +234,10 @@ def scrape_websites(
 
             result: Dict = app.scrape(url, formats=formats).model_dump()
             # 200 -> Request was success
-            result_status_code: int = result["metadata"]["status_code"]
+            result_status_code: int = result["metadata"].get(
+                "status_code", "404")
 
-            if result_status_code== 200:
+            if result_status_code == 200:
 
                 metadata_entry = {
                     "name": name,
@@ -242,26 +246,27 @@ def scrape_websites(
                     "scrape_time": datetime.now().isoformat(),
                     "scraped_at": datetime.now().isoformat(),
                     "formats": formats,
-                    "title": result["metadata"]["og_title"],
-                    "description": result["metadata"]["og_description"],
+                    "title": result["metadata"].get("og_title", ""),
+                    "description": result["metadata"].get("og_description", ""),
                     "content_files": {},
                     "content": {},
                     "success": True
                 }
-                
+
                 # Loop over formats
                 for format in formats:
                     filename = f"{normalize_filename(name)}_{format}.txt"
                     save_scrape_result(os.path.join(
                         path, filename), result[format])
                     metadata_entry["content_files"][format] = filename
-                
+
                 # Always update on success
                 metadata[name] = metadata_entry
                 successful_scrapes.append(name)
 
             else:
-                logger.error(f"Scraping {name}: {url} has failed with {result_status_code}")
+                logger.error(
+                    f"Scraping {name}: {url} has failed with {result_status_code}")
                 # Only update if no existing entry or existing entry was also a failure
                 if name not in metadata or not metadata[name].get("success", False):
                     metadata_entry = create_empty_metadata_entry(name, url)
@@ -271,35 +276,38 @@ def scrape_websites(
         # When we had an error during scraping we will mark this bad
         except Exception as err:
             logger.error(f"Scraping {name}: {url} has failed Exception {err}")
-            
+
             # Only update if no existing entry or existing entry was also a failure
             if name not in metadata or not metadata[name].get("success", False):
-                metadata_entry: MetadataEntry = create_empty_metadata_entry(name, url)
+                metadata_entry: MetadataEntry = create_empty_metadata_entry(
+                    name, url)
                 metadata_entry["success"] = False
                 metadata[name] = metadata_entry
             continue
-    
+
     # Save the Metadata
     metadata_save(path, metadata)
 
     return successful_scrapes
 
+
 @mcp.tool()
 def extract_scraped_info(identifier: str) -> str:
     """
     Extract information about a scraped website.
-    
+
     Args:
         identifier: The provider name, full URL, or domain to look for
-        
+
     Returns:
         Formatted JSON string with the scraped information
     """
-    
+
     logger.info(f"Extracting information for identifier: {identifier}")
     logger.info(f"Files in {SCRAPE_DIR}: {os.listdir(SCRAPE_DIR)}")
 
-    metadata_dict:Dict[str, MetadataEntry]  = metadata_load(os.path.join(SCRAPE_DIR))
+    metadata_dict: Dict[str, MetadataEntry] = metadata_load(
+        os.path.join(SCRAPE_DIR))
 
     # loop over all entries
     for name, metadata in metadata_dict.items():
@@ -310,13 +318,14 @@ def extract_scraped_info(identifier: str) -> str:
                 or identifier == metadata.get('url', '')
                 or identifier == metadata.get('domain', '')
             ):
-                
+
                 # skip bad results
                 if not metadata.get('success', False):
-                    logger.warning(f"Found {name} but scrape was not successful")
+                    logger.warning(
+                        f"Found {name} but scrape was not successful")
                     continue
 
-                result:MetadataEntry = MetadataEntry(metadata)  # shallow copy
+                result: MetadataEntry = metadata.copy()  # shallow copy
                 content_files = metadata.get('content_files') or {}
 
                 if content_files:
