@@ -11,17 +11,52 @@ import re
 
 from dotenv import load_dotenv
 from anthropic import Anthropic
-from mcp import ClientSession, StdioServerParameters
+from anthropic.types import TextBlock, ToolUseBlock
+from mcp import ClientSession, StdioServerParameters,types
 from mcp.client.stdio import stdio_client
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
+# System prompt to guide LLM tool usage hierarchy
+SYSTEM_PROMPT = """You are a helpful assistant that answers questions about LLM pricing.
+
+CRITICAL TOOL USAGE HIERARCHY - Follow this order strictly:
+
+1. CHECK DATABASE FIRST:
+   - Use read_query to check the pricing_plans table for existing data
+   - Query example: SELECT * FROM pricing_plans WHERE company_name LIKE '%<company>%'
+   - If data exists and is relevant, use it to answer the query
+
+2. CHECK CACHED SCRAPES:
+   - If no DB data, use extract_scraped_info with the company name/domain
+   - This loads already-scraped content without making new requests
+
+
+3. SCRAPE AS LAST RESORT:
+   - Only use scrape_websites if data doesn't exist in DB or cache
+   - This makes actual HTTP requests and should be avoided when possible
+
+Always prefer existing data over fresh scraping to reduce API calls and costs.
+
+PARALLEL TOOL EXECUTION:
+- When you need to perform multiple independent operations, call ALL tools simultaneously in a single response
+- For example, if asked about multiple companies, check the database for all companies in ONE response
+- IMPORTANT: The scrape_websites tool accepts a dictionary of multiple websites and returns ALL results at once
+- Do NOT call scrape_websites multiple times for different subsets - pass ALL websites in ONE call
+- This significantly reduces latency by executing tools in parallel rather than sequentially"""
+
+# ===========================================================================
+#                            Type Definitions
+# ===========================================================================
 class ToolDefinition(TypedDict):
     name: str
     description: str
     input_schema: dict
 
+# ===========================================================================
+#                            Configuration
+# ===========================================================================
 
 class Configuration:
     """Manages configuration and environment variables for the MCP client."""
@@ -51,7 +86,24 @@ class Configuration:
             JSONDecodeError: If configuration file is invalid JSON.
             ValueError: If configuration file is missing required fields.
         """
-        # complete
+        try:
+            with open(file_path) as config_file:
+                config = json.load(config_file)
+
+            if 'mcpServers' not in config:
+                raise ValueError(
+                    "Configuration file missing 'mcpServers' field")
+
+            return config
+        except FileNotFoundError:
+            logger.warning(f"file was not found: {file_path}")
+            raise
+        except json.JSONDecodeError:
+            logger.warning(f"file: {file_path} was not abled to be parsed")
+            raise
+        except ValueError:
+            logger.warning(f"file: {file_path} has value error")
+            raise
 
     @property
     def anthropic_api_key(self) -> str:
@@ -67,6 +119,9 @@ class Configuration:
             raise ValueError("ANTHROPIC_API_KEY not found in environment variables")
         return self.api_key
 
+# ===========================================================================
+#                    MCP Server Manager
+# ===========================================================================
 
 class Server:
     """Manages MCP server connections and tool execution."""
@@ -85,8 +140,14 @@ class Server:
         if command is None:
             raise ValueError("The command must be a valid string and cannot be None.")
 
-        # complete params
-        server_params = StdioServerParameters()
+        # Implement the Server Parameter from the config
+        server_params = StdioServerParameters(
+            command=command,
+            args=self.config.get("args", []),  # Get args from config
+            env={**os.environ, **self.config["env"]
+                 } if self.config.get("env") else None,
+        )
+
         try:
             stdio_transport = await self.exit_stack.enter_async_context(stdio_client(server_params))
             read, write = stdio_transport
@@ -108,7 +169,23 @@ class Server:
         Raises:
             RuntimeError: If the server is not initialized.
         """
-        # complete
+        if not self.session:
+            raise RuntimeError(f"Server '{self.name}' is not initialized")
+
+        try:
+            tool_data = []
+            tools = await self.session.list_tools()
+            for tool in tools.tools:
+                tool_data.append({
+                    "name": tool.name,
+                    "description": tool.description,
+                    "input_schema": tool.inputSchema
+                })
+                logger.info(f"Tool: {tool.name},description:{tool.description}, input_schema:{tool.inputSchema}")
+            return tool_data
+        except Exception as e:
+            logging.error(f"Error Listening server Tools {self.name}: {e}")
+            raise
 
     async def execute_tool(
         self,
@@ -132,7 +209,25 @@ class Server:
             RuntimeError: If server is not initialized.
             Exception: If tool execution fails after all retries.
         """
-        # complete
+        if not self.session:
+            raise RuntimeError(f"Server {self.name} not initialized")
+
+        attempt = 0
+        while attempt < retries:
+            try:
+                logging.info(f"Executing {tool_name}...")
+                result = await self.session.call_tool(name=tool_name, arguments=arguments, read_timeout_seconds=timedelta(seconds=60))
+                return result
+            except Exception as e:
+                attempt += 1
+                logging.warning(
+                    f"Error executing tool: {e}. Attempt {attempt} of {retries}.")
+                if attempt < retries:
+                    logging.info(f"Retrying in {delay} seconds...")
+                    await asyncio.sleep(delay)
+                else:
+                    logging.error("Max retries reached. Failing.")
+                    raise
 
     async def cleanup(self) -> None:
         """Clean up server resources."""
@@ -144,7 +239,9 @@ class Server:
             except Exception as e:
                 logging.error(f"Error during cleanup of server {self.name}: {e}")
 
-
+# ===========================================================================
+#                            Data Extraction
+# ===========================================================================
 class DataExtractor:
     """Handles extraction and storage of structured data from LLM responses."""
     
@@ -232,8 +329,27 @@ class DataExtractor:
             extraction_response = extraction_response.replace("```json\n", "").replace("```", "")
             pricing_data = json.loads(extraction_response)
             
+            if len(pricing_data.get("plans", [])) == 0:
+                logging.info(
+                    f"No pricing plans extracted for {pricing_data.get('company_name', 'Unknown Company')}")
+                return
+            
             for plan in pricing_data.get("plans", []):
-                # complete
+                result = await self.sqlite_server.execute_tool("write_query", {
+                    "query": f"""
+                        INSERT INTO pricing_plans (company_name, plan_name, input_tokens, output_tokens, currency, billing_period, features, limitations, source_query)
+                        VALUES (
+                            '{pricing_data.get("company_name", "Unknown Company")}',
+                            '{plan.get("plan_name", "Unknown Plan")}',
+                            '{plan.get("input_tokens", 0)}',
+                            '{plan.get("output_tokens", 0)}',
+                            '{plan.get("currency", "USD")}',
+                            '{plan.get("billing_period", "unknown")}',
+                            '{json.dumps(plan.get("features", []))}',
+                            '{plan.get("limitations", "")}',
+                            '{user_query.replace("'","''")}')
+                        """
+                })
             
             logger.info(f"Stored {len(pricing_data.get('plans', []))} pricing plans")
             
@@ -262,14 +378,26 @@ class ChatSession:
 
     async def process_query(self, query: str) -> None:
         """Process a user query and extract/store relevant data."""
+
+        # Step 1 : Create the initial prompt and send it to the LLM
         messages = [{'role': 'user', 'content': query}]
+        logger.info(f"Calling anthropic: process_query first request")
         response = self.anthropic.messages.create(
-            max_tokens=2024,
-            model='<ENTER_MODEL_NAME>', 
-            tools=self.available_tools,
-            messages=messages
-        )
-        
+                max_tokens=2024,
+                model='claude-sonnet-4-5-20250929',
+                system=SYSTEM_PROMPT,
+                tools=self.available_tools,
+                messages=messages
+            )
+        # Log actual usage
+        logger.info(f"Input tokens: {response.usage.input_tokens:,}")
+        logger.info(f"Output tokens: {response.usage.output_tokens:,}")
+        logger.info(f"Total tokens: {response.usage.input_tokens + response.usage.output_tokens:,}")
+        # Check if approaching limits
+        if response.usage.input_tokens > 25000:
+            logger.warning(f"High input token usage: {response.usage.input_tokens:,}")
+
+        # Loop
         full_response = ""
         source_url = None
         used_web_search = False
@@ -277,15 +405,129 @@ class ChatSession:
         process_query = True
         while process_query:
             assistant_content = []
+            tool_uses = []
+
+            # Count how many tools Claude wants to use
+            num_tool_calls = sum(1 for c in response.content if c.type == 'tool_use')
+            if num_tool_calls > 0:
+                logger.info(f"Claude requested {num_tool_calls} tool(s) in parallel")
+
             for content in response.content:
                 if content.type == 'text':
                     # complete
+                    full_response += content.text + "\n"
+                    # Add the content to the assistant's message
+                    assistant_content.append(content)
+                    # Check if this is the only content - if so, model is done
+                    if len(response.content) == 1:
+                        process_query = False
+
                 elif content.type == 'tool_use':
-                    # complete
+                    assistant_content.append(content)
+
+                    # Tool Step 1: Tool Identification
+                    tool_id = content.id
+                    tool_name = content.name
+                    tool_args = content.input
+                    logging.info(f"Tool ID: {content.id}")
+                    logging.info(f"Tool Name: {tool_name}")
+                    logging.info(f"Tool Arguments: {tool_args}")
+                    
+                    # Tool Step 2: Find the server name who provides the tool
+                    server_name = self.tool_to_server.get(tool_name)
+                    if not server_name:
+                        logging.error(f"Tool {tool_name} not found in tool_to_server mapping")
+                        # We add a failed message to our tool call rather tha the results
+                        tool_uses.append({
+                            'type': 'tool_result',
+                            'tool_use_id': tool_id,
+                            'content': f"Error: Tool {tool_name} not found",
+                            'is_error': True
+                        })
+                        continue
+                    
+                    # Tool Step 3: find the server instance with the server name
+                    server = next((s for s in self.servers if s.name == server_name), None)
+                    if not server:
+                        logging.error(f"Server {server_name} not found")
+                        # We add a failed message to our tool call rather tha the results
+                        tool_uses.append({
+                            'type': 'tool_result',
+                            'tool_use_id': tool_id,
+                            'content': f"Error: Server {server_name} not found",
+                            'is_error': True
+                        })
+                        continue
         
+                    # Tool Step 4: Call the Server Tool
+                    try:
+                        logging.info(f"Executing tool {tool_name} on server {server_name}")
+                        tool_result = await server.execute_tool(tool_name, tool_args)
+                        logging.info(f"Tool {tool_name} result: {tool_result.content[0].text[:50]}...")
+
+
+                        #  # Log for debugging
+                        result_unstructured = tool_result.content[0]
+
+                        result = ""
+                        if isinstance(result_unstructured, types.TextContent):
+                            # logging.info(f"Tool result: {result_unstructured.text}")
+                            result = result_unstructured.text 
+
+                            if tool_name == "extract_scraped_info":
+                                pass
+
+                        tool_uses.append({
+                            'type': 'tool_result',
+                            'tool_use_id': tool_id,
+                            'content': result,
+                            'is_error': False
+                        })
+                    except Exception as e:
+                        logging.error(f"Error executing tool {tool_name}: {e}")
+                        # We add a failed message to our tool call rather tha the results
+                        tool_uses.append({
+                            'type': 'tool_result',
+                            'tool_use_id': tool_id,
+                            'content': f"Error executing tool: {e}",
+                            'is_error': True
+                        })
+
+
+            ## Build messages correctly - ONE assistant message, ONE user message
+            messages.append({'role': 'assistant', 'content': assistant_content})
+            messages.append({'role': 'user', 'content': tool_uses})
+
+            await asyncio.sleep(1) 
+
+            # Phase 4: Make ONE API call with all tool results
+            logger.info(f"Calling anthropic: process_query result")
+            response = self.anthropic.messages.create(
+                max_tokens=2024,
+                model='claude-sonnet-4-5-20250929',
+                system=SYSTEM_PROMPT,
+                tools=self.available_tools,
+                messages=messages
+            )
+
+            # Log actual usage
+            logger.info(f"Input tokens: {response.usage.input_tokens:,}")
+            logger.info(f"Output tokens: {response.usage.output_tokens:,}")
+            logger.info(f"Total tokens: {response.usage.input_tokens + response.usage.output_tokens:,}")
+            # Check if approaching limits
+            if response.usage.input_tokens > 25000:
+                logger.warning(f"High input token usage: {response.usage.input_tokens:,}")
+
+            if len(response.content) == 1 and response.content[0].type == 'text':
+                    source_url = self._extract_url_from_result(response.content[0].text)
+                    full_response += response.content[0].text
+                    process_query = False
+
+        print(full_response.strip())
         if self.data_extractor and full_response.strip():
             await self.data_extractor.extract_and_store_data(query, full_response.strip(), source_url)
 
+        
     def _extract_url_from_result(self, result_text: str) -> str | None:
         """Extract URL from tool result."""
         url_pattern = r'https?://[^\s<>"{}|\\^`\[\]]+'
@@ -323,7 +565,19 @@ class ChatSession:
             return
             
         try:
-            # complete
+            pricing = await self.sqlite_server.execute_tool("read_query", {
+                "query": "SELECT company_name, plan_name, input_tokens, output_tokens, currency FROM pricing_plans ORDER BY created_at DESC LIMIT 5"
+            })
+
+            print("\nRecently Stored Data:")
+            print("=" * 50)
+
+            print("\nPricing Plans:")
+            # The result.content is a list with one item, a dict, where the 'text' key holds the rows
+            for plan in pricing.content[0]["text"]:
+                print(f"  • {plan['company_name']}: {plan['plan_name']} - Input Token ${plan['input_tokens']}, Output Tokens ${plan['output_tokens']}")
+
+            print("=" * 50)
         except Exception as e:
             print(f"Error showing data: {e}")
 
