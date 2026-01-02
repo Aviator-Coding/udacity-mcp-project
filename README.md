@@ -1,4 +1,21 @@
 
+## MCP-Server
+
+Test Data for scrape website endpoint
+```json
+{
+  "cloudrift": "https://www.cloudrift.ai/inference",
+  "deepinfra": "https://deepinfra.com/pricing",
+  "fireworks": "https://fireworks.ai/pricing#serverless-pricing",
+  "groq": "https://groq.com/pricing"
+}
+```
+
+Run the server in a test instance:
+```
+$ uv run mcp dev starter_server.py 
+```
+
 ## Original Udacity Instruction
 In this project, you are going to make a chatbot to scrape LLM Inference Serving websites to research costs of serving various LLMs. You will do this by writing an MCP Server that hooks up to Firecrawl's API and saving the data in a SQLite Database. You should use the following websites to scrape:
 
