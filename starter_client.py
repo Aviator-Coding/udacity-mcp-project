@@ -1,4 +1,5 @@
 import asyncio
+import ast
 import json
 import logging
 import os
@@ -15,23 +16,47 @@ from anthropic.types import TextBlock, ToolUseBlock
 from mcp import ClientSession, StdioServerParameters,types
 from mcp.client.stdio import stdio_client
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+# Configure logging to both console and file
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=[
+        logging.FileHandler("mcp_client.log"),  # Log to file
+        logging.StreamHandler()  # Log to console
+    ]
+)
 logger = logging.getLogger(__name__)
 
 # System prompt to guide LLM tool usage hierarchy
 SYSTEM_PROMPT = """You are a helpful assistant that answers questions about LLM pricing.
 
+DATABASE SCHEMA:
+The pricing_plans table has the following structure:
+- id: INTEGER PRIMARY KEY AUTOINCREMENT
+- company_name: TEXT NOT NULL
+- plan_name: TEXT NOT NULL
+- input_tokens: REAL (price per million input tokens)
+- output_tokens: REAL (price per million output tokens)
+- currency: TEXT (default 'USD')
+- billing_period: TEXT ('monthly', 'yearly', 'one-time')
+- features: TEXT (JSON array of features)
+- limitations: TEXT (any limitations mentioned)
+- source_query: TEXT (original user query)
+- created_at: DATETIME (default CURRENT_TIMESTAMP)
+
+IMPORTANT: Only query fields that exist in the schema above. Do not query non-existent fields.
+
 CRITICAL TOOL USAGE HIERARCHY - Follow this order strictly:
 
 1. CHECK DATABASE FIRST:
    - Use read_query to check the pricing_plans table for existing data
-   - Query example: SELECT * FROM pricing_plans WHERE company_name LIKE '%<company>%'
+   - Query example: SELECT * FROM pricing_plans WHERE LOWER(company_name) LIKE LOWER('%<company>%')
+   - Use LOWER() for case-insensitive matching since the database contains mixed-case company names
    - If data exists and is relevant, use it to answer the query
 
 2. CHECK CACHED SCRAPES:
    - If no DB data, use extract_scraped_info with the company name/domain
    - This loads already-scraped content without making new requests
-
 
 3. SCRAPE AS LAST RESORT:
    - Only use scrape_websites if data doesn't exist in DB or cache
@@ -41,6 +66,7 @@ Always prefer existing data over fresh scraping to reduce API calls and costs.
 
 PARALLEL TOOL EXECUTION:
 - When you need to perform multiple independent operations, call ALL tools simultaneously in a single response
+
 - For example, if asked about multiple companies, check the database for all companies in ONE response
 - IMPORTANT: The scrape_websites tool accepts a dictionary of multiple websites and returns ALL results at once
 - Do NOT call scrape_websites multiple times for different subsets - pass ALL websites in ONE call
@@ -475,7 +501,30 @@ class ChatSession:
                             result = result_unstructured.text 
 
                             if tool_name == "extract_scraped_info":
-                                pass
+                                # Remove HTML content to reduce token usage
+                                try:
+                                    parsed_result = json.loads(result)
+
+                                    # Remove HTML from content
+                                    if isinstance(parsed_result, dict) and "content" in parsed_result:
+                                        parsed_result["content"].pop("html", None)
+
+                                    # Remove HTML from content_files
+                                    if isinstance(parsed_result, dict) and "content_files" in parsed_result:
+                                        parsed_result["content_files"].pop("html", None)
+
+                                    # Remove "html" from formats array
+                                    if isinstance(parsed_result, dict) and "formats" in parsed_result:
+                                        if isinstance(parsed_result["formats"], list) and "html" in parsed_result["formats"]:
+                                            parsed_result["formats"].remove("html")
+
+                                    # Convert back to string
+                                    result = json.dumps(parsed_result)
+                                    logging.info("Removed HTML content from extract_scraped_info result")
+                                except json.JSONDecodeError:
+                                    logging.warning("Could not parse extract_scraped_info result as JSON, using original result")
+                                except Exception as e:
+                                    logging.warning(f"Error filtering HTML from result: {e}, using original result")
 
                         tool_uses.append({
                             'type': 'tool_result',
@@ -498,7 +547,7 @@ class ChatSession:
             messages.append({'role': 'assistant', 'content': assistant_content})
             messages.append({'role': 'user', 'content': tool_uses})
 
-            await asyncio.sleep(1) 
+            await asyncio.sleep(10) 
 
             # Phase 4: Make ONE API call with all tool results
             logger.info(f"Calling anthropic: process_query result")
