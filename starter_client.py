@@ -292,7 +292,8 @@ class DataExtractor:
                     features TEXT,  -- JSON array
                     limitations TEXT,
                     source_query TEXT,
-                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(company_name, plan_name)
                 )
                 """
             })
@@ -310,7 +311,7 @@ class DataExtractor:
                 model='claude-sonnet-4-5-20250929',
                 messages=[{'role': 'user', 'content': prompt}]
             )
-            
+
             text_content = ""
             for content in response.content:
                 if content.type == 'text':
@@ -320,7 +321,7 @@ class DataExtractor:
             
         except Exception as e:
             logging.error(f"Error in structured extraction: {e}")
-            return '{"error": "extraction failed"}'
+            return '{"error": "extraction failed", "plans": []}'
     
     async def extract_and_store_data(self, user_query: str, llm_response: str, 
                                    source_url: str = None) -> None:
@@ -363,7 +364,7 @@ class DataExtractor:
             for plan in pricing_data.get("plans", []):
                 result = await self.sqlite_server.execute_tool("write_query", {
                     "query": f"""
-                        INSERT INTO pricing_plans (company_name, plan_name, input_tokens, output_tokens, currency, billing_period, features, limitations, source_query)
+                        INSERT OR REPLACE INTO pricing_plans (company_name, plan_name, input_tokens, output_tokens, currency, billing_period, features, limitations, source_query)
                         VALUES (
                             '{pricing_data.get("company_name", "Unknown Company")}',
                             '{plan.get("plan_name", "Unknown Plan")}',
@@ -501,6 +502,7 @@ class ChatSession:
                             result = result_unstructured.text 
 
                             if tool_name == "extract_scraped_info":
+                                used_web_search=True
                                 # Remove HTML content to reduce token usage
                                 try:
                                     parsed_result = json.loads(result)
@@ -573,7 +575,7 @@ class ChatSession:
                     process_query = False
 
         print(full_response.strip())
-        if self.data_extractor and full_response.strip():
+        if self.data_extractor and full_response.strip() and used_web_search:
             await self.data_extractor.extract_and_store_data(query, full_response.strip(), source_url)
 
         
@@ -622,12 +624,30 @@ class ChatSession:
             print("=" * 50)
 
             print("\nPricing Plans:")
-            # The result.content is a list with one item, a dict, where the 'text' key holds the rows
-            for plan in pricing.content[0]["text"]:
-                print(f"  • {plan['company_name']}: {plan['plan_name']} - Input Token ${plan['input_tokens']}, Output Tokens ${plan['output_tokens']}")
+            # The result.content is a list of TextContent objects
+            result_text = pricing.content[0].text
+            
+            # Log the raw result for debugging
+            logger.info(f"Raw result from database: {result_text[:200]}")
+            
+            # Try to parse as JSON first, then as Python literal
+            try:
+                plans = json.loads(result_text) if result_text else []
+            except json.JSONDecodeError:
+                # SQLite MCP returns Python dict syntax with single quotes, not JSON
+                try:
+                    plans = ast.literal_eval(result_text) if result_text else []
+                except (ValueError, SyntaxError):
+                    logger.info("Result is not JSON or Python literal, printing raw text")
+                    print(result_text)
+                    plans = []
+
+            for plan in plans:
+                print(f"  • {plan['company_name']}: {plan['plan_name']} - Input: ${plan['input_tokens']}/M, Output: ${plan['output_tokens']}/M")
 
             print("=" * 50)
         except Exception as e:
+            logger.error(f"Error showing data: {e}", exc_info=True)
             print(f"Error showing data: {e}")
 
     async def start(self) -> None:
